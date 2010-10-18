@@ -13,6 +13,15 @@ config CAN_MCP251X
 	  Driver for the Microchip MCP251x and MCP25625 SPI CAN
 	  controllers.
 
+config CAN_MCP2515
+	tristate "Microchip MCP2515 SPI CAN controller"
+	help
+	  Driver for the Microchip MCP2515 SPI CAN controllers.  This
+	  is a new driver that uses the asynchronous SPI API directly,
+	  eliminating the overhead of threads, work queues and
+	  synchronous SPI wrappers, thus reducing SPI transactions
+	  latency to a minimum.
+
 source "drivers/net/can/spi/mcp251xfd/Kconfig"
 
 endmenu
