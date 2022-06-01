@@ -690,8 +690,10 @@ static void mcp2515_clear_canintf_complete(void *context)
 	if (priv->canintf & CANINTF_TX0IF) {
 		struct sk_buff *skb = priv->skb;
 		if (skb) {
-			dev->stats.tx_bytes += can_get_echo_skb(dev, 0);
+			struct can_frame *f = (struct can_frame *)skb->data;
+			dev->stats.tx_bytes += f->can_dlc;
 			dev->stats.tx_packets++;
+			can_get_echo_skb(dev, 0);
 		}
 		priv->skb = NULL;
 		netif_wake_queue(dev);
