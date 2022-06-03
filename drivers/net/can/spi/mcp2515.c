@@ -141,6 +141,9 @@ struct mcp2515_priv {
 	struct spi_transfer transfer;
 	u8 rx_buf[14] __attribute__((aligned(8)));
 	u8 tx_buf[14] __attribute__((aligned(8)));
+
+	struct workqueue_struct *wq;
+	struct work_struct irq_work;
 };
 
 static struct can_bittiming_const mcp2515_bittiming_const = {
@@ -379,6 +382,7 @@ static void mcp2515_read_flags(struct net_device *dev)
 {
 	struct mcp2515_priv *priv = netdev_priv(dev);
 	u8 *buf = (u8 *)priv->transfer.tx_buf;
+	int err;
 
 	buf[0] = MCP2515_INSTRUCTION_READ;
 	buf[1] = CANINTF;
@@ -387,7 +391,9 @@ static void mcp2515_read_flags(struct net_device *dev)
 	priv->transfer.len = 4;
 	priv->message.complete = mcp2515_read_flags_complete;
 
-	mcp2515_spi_async(dev);
+	err = spi_async(priv->spi, &priv->message);
+	if (err)
+		netdev_err(dev, "%s failed with err=%d\n", __func__, err);
 }
 
 /*
@@ -538,7 +544,6 @@ static void mcp2515_read_flags_complete(void *context)
 	struct mcp2515_priv *priv = netdev_priv(dev);
 	u8 *buf = priv->transfer.rx_buf;
 	unsigned canintf;
-	unsigned long flags;
 
 	priv->canintf = canintf = buf[2];
 	priv->eflg = buf[3];
@@ -550,18 +555,18 @@ static void mcp2515_read_flags_complete(void *context)
 	else if (canintf)
 		mcp2515_clear_canintf(dev);
 	else {
-		spin_lock_irqsave(&priv->lock, flags);
+		spin_lock(&priv->lock);
 		if (priv->transmit) {
 			priv->transmit = 0;
-			spin_unlock_irqrestore(&priv->lock, flags);
+			spin_unlock(&priv->lock);
 			mcp2515_load_txb0(priv->skb, dev);
 		} else if (priv->interrupt) {
 			priv->interrupt = 0;
-			spin_unlock_irqrestore(&priv->lock, flags);
+			spin_unlock(&priv->lock);
 			mcp2515_read_flags(dev);
 		} else {
 			priv->busy = 0;
-			spin_unlock_irqrestore(&priv->lock, flags);
+			spin_unlock(&priv->lock);
 		}
 	}
 }
@@ -612,15 +617,14 @@ static void mcp2515_read_rxb_complete(void *context)
 static void mcp2515_transmit_or_read_flags(struct net_device *dev)
 {
 	struct mcp2515_priv *priv = netdev_priv(dev);
-	unsigned long flags;
 
-	spin_lock_irqsave(&priv->lock, flags);
+	spin_lock(&priv->lock);
 	if (priv->transmit) {
 		priv->transmit = 0;
-		spin_unlock_irqrestore(&priv->lock, flags);
+		spin_unlock(&priv->lock);
 		mcp2515_load_txb0(priv->skb, dev);
 	} else {
-		spin_unlock_irqrestore(&priv->lock, flags);
+		spin_unlock(&priv->lock);
 		mcp2515_read_flags(dev);
 	}
 }
@@ -727,18 +731,29 @@ static irqreturn_t mcp2515_interrupt(int irq, void *dev_id)
 	struct net_device *dev = dev_id;
 	struct mcp2515_priv *priv = netdev_priv(dev);
 
+	queue_work(priv->wq, &priv->irq_work);
+
+	return IRQ_HANDLED;
+}
+
+/*
+ * IRQ work handler, handles interrupts outside the interrupt context.
+ */
+static void mcp2515_irq_work_handler(struct work_struct *ws)
+{
+	struct mcp2515_priv *priv;
+
+	priv = container_of(ws, struct mcp2515_priv, irq_work);
 	spin_lock(&priv->lock);
 	if (priv->busy) {
 		priv->interrupt = 1;
 		spin_unlock(&priv->lock);
-		return IRQ_HANDLED;
+		return;
 	}
 	priv->busy = 1;
 	spin_unlock(&priv->lock);
 
-	mcp2515_read_flags(dev);
-
-	return IRQ_HANDLED;
+	mcp2515_read_flags(dev_get_drvdata(&priv->spi->dev));
 }
 
 /*
@@ -748,7 +763,6 @@ static netdev_tx_t mcp2515_start_xmit(struct sk_buff *skb,
 				      struct net_device *dev)
 {
 	struct mcp2515_priv *priv = netdev_priv(dev);
-	unsigned long flags;
 
 	if (can_dropped_invalid_skb(dev, skb))
 		return NETDEV_TX_OK;
@@ -756,14 +770,14 @@ static netdev_tx_t mcp2515_start_xmit(struct sk_buff *skb,
 	netif_stop_queue(dev);
 	priv->skb = skb;
 
-	spin_lock_irqsave(&priv->lock, flags);
+	spin_lock(&priv->lock);
 	if (priv->busy) {
 		priv->transmit = 1;
-		spin_unlock_irqrestore(&priv->lock, flags);
+		spin_unlock(&priv->lock);
 		return NETDEV_TX_OK;
 	}
 	priv->busy = 1;
-	spin_unlock_irqrestore(&priv->lock, flags);
+	spin_unlock(&priv->lock);
 
 	mcp2515_load_txb0(skb, dev);
 
@@ -1028,12 +1042,21 @@ static int mcp2515_probe(struct spi_device *spi)
 	if (err)
 		goto out_clk;
 
+	priv->wq = alloc_workqueue("mcp2515_wq",
+		       WQ_FREEZABLE | WQ_MEM_RECLAIM | WQ_HIGHPRI, 0);
+	if (!priv->wq) {
+		err = -ENOMEM;
+		goto out_clk;
+	}
+	INIT_WORK(&priv->irq_work, mcp2515_irq_work_handler);
+
+
 	priv->power = devm_regulator_get_optional(&spi->dev, "vdd");
 	priv->transceiver = devm_regulator_get_optional(&spi->dev, "xceiver");
 	if ((PTR_ERR(priv->power) == -EPROBE_DEFER) ||
 		(PTR_ERR(priv->transceiver) == -EPROBE_DEFER)) {
 		err = -EPROBE_DEFER;
-		goto out_clk;
+		goto out_wq;
 	}
 
 	mcp2515_setup_spi_messages(dev);
@@ -1052,6 +1075,9 @@ static int mcp2515_probe(struct spi_device *spi)
  out_spi:
 	mcp2515_cleanup_spi_messages(dev);
 	dev_set_drvdata(&spi->dev, NULL);
+ out_wq:
+	destroy_workqueue(priv->wq);
+	priv->wq = NULL;
  out_clk:
 	clk_disable_unprepare(clk);
  out_free:
@@ -1066,11 +1092,17 @@ static int mcp2515_probe(struct spi_device *spi)
 static int mcp2515_remove(struct spi_device *spi)
 {
 	struct net_device *dev = dev_get_drvdata(&spi->dev);
+	struct mcp2515_priv *priv = netdev_priv(dev);
 
 	mcp2515_unregister_candev(dev);
 	mcp2515_cleanup_spi_messages(dev);
 	dev_set_drvdata(&spi->dev, NULL);
 	free_candev(dev);
+
+	cancel_delayed_work_sync(&priv->delay);
+	cancel_work_sync(&priv->irq_work);
+	destroy_workqueue(priv->wq);
+	priv->wq = NULL;
 
 	return 0;
 }
