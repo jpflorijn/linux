@@ -1064,6 +1064,7 @@ static int mcp2515_probe(struct spi_device *spi)
 	err = mcp2515_register_candev(dev);
 	if (err) {
 		netdev_err(dev, "registering netdev failed");
+		err = -EPROBE_DEFER;
 		goto out_spi;
 	}
 
