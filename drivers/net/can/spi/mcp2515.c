@@ -148,7 +148,7 @@ struct mcp2515_priv {
 
 static struct can_bittiming_const mcp2515_bittiming_const = {
 	.name = KBUILD_MODNAME,
-	.tseg1_min = 2,
+	.tseg1_min = 3,
 	.tseg1_max = 16,
 	.tseg2_min = 2,
 	.tseg2_max = 8,
