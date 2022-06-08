@@ -115,8 +115,8 @@ MODULE_LICENSE("GPL");
 /* RXBnDLC bits */
 #define RXBDLC_RTR			BIT(6)
 
-
 #define MCP2515_DMA_SIZE		32
+#define MCP2515_IRQ_DELAY		(HZ / 10)
 
 /* Network device private data */
 struct mcp2515_priv {
@@ -136,6 +136,9 @@ struct mcp2515_priv {
 	unsigned interrupt:1;	/* set when pending interrupt handling */
 	unsigned transmit:1;	/* set when pending transmission */
 
+	unsigned extra:1;	/* set when the delay queue tried reading CANINTF */
+	unsigned skip;
+
 	/* Message, transfer and buffers for one async spi transaction */
 	struct spi_message message;
 	struct spi_transfer transfer;
@@ -144,6 +147,7 @@ struct mcp2515_priv {
 
 	struct workqueue_struct *wq;
 	struct work_struct irq_work;
+	struct delayed_work delay;
 };
 
 static struct can_bittiming_const mcp2515_bittiming_const = {
@@ -548,6 +552,15 @@ static void mcp2515_read_flags_complete(void *context)
 	priv->canintf = canintf = buf[2];
 	priv->eflg = buf[3];
 
+	/* We really ought never miss the edge triggered interrupt. But if we do, and the extra read is needed, note so here.*/
+	if (priv->extra) {
+		priv->extra = 0;
+		if (priv->canintf != 0 || priv->eflg != 0)
+			netdev_dbg(dev, "delayed read_flags detected a missed interrupt: CANINTF=%u, EFLG=%u\n", priv->canintf, priv->eflg);
+	}
+
+	/* We just read, delay reading again. */
+
 	if (canintf & CANINTF_RX0IF)
 		mcp2515_read_rxb0(dev);
 	else if (canintf & CANINTF_RX1IF)
@@ -567,6 +580,9 @@ static void mcp2515_read_flags_complete(void *context)
 		} else {
 			priv->busy = 0;
 			spin_unlock(&priv->lock);
+
+			/* Retry shortly. */
+			queue_delayed_work(priv->wq, &priv->delay, MCP2515_IRQ_DELAY);
 		}
 	}
 }
@@ -754,6 +770,30 @@ static void mcp2515_irq_work_handler(struct work_struct *ws)
 	spin_unlock(&priv->lock);
 
 	mcp2515_read_flags(dev_get_drvdata(&priv->spi->dev));
+}
+
+/*
+ * Delayed work handler, in effect polls the MCP2515's interrupts.
+ */
+static void mcp2515_delay_handler(struct work_struct *ws)
+{
+	struct mcp2515_priv *priv;
+	priv = container_of(ws, struct mcp2515_priv, delay.work);
+
+	spin_lock(&priv->lock);
+	if (priv->busy) {
+		spin_unlock(&priv->lock);
+		if (++priv->skip > 10)
+			netdev_dbg(dev_get_drvdata(&priv->spi->dev),
+				"continually busy (now %i times)\n", priv->skip);
+	} else {
+		priv->busy = 1;
+		spin_unlock(&priv->lock);
+		priv->skip = 0;
+		priv->extra = 1;
+
+		mcp2515_read_flags(dev_get_drvdata(&priv->spi->dev));
+	}
 }
 
 /*
@@ -1049,7 +1089,7 @@ static int mcp2515_probe(struct spi_device *spi)
 		goto out_clk;
 	}
 	INIT_WORK(&priv->irq_work, mcp2515_irq_work_handler);
-
+	INIT_DELAYED_WORK(&priv->delay, mcp2515_delay_handler);
 
 	priv->power = devm_regulator_get_optional(&spi->dev, "vdd");
 	priv->transceiver = devm_regulator_get_optional(&spi->dev, "xceiver");
