@@ -116,7 +116,7 @@ MODULE_LICENSE("GPL");
 #define RXBDLC_RTR			BIT(6)
 
 #define MCP2515_DMA_SIZE		32
-#define MCP2515_IRQ_DELAY		(HZ / 10)
+#define MCP2515_IRQ_DELAY		(HZ / 5)
 
 /* Network device private data */
 struct mcp2515_priv {
@@ -388,6 +388,7 @@ static void mcp2515_read_flags(struct net_device *dev)
 	u8 *buf = (u8 *)priv->transfer.tx_buf;
 	int err;
 
+	cancel_delayed_work(&priv->delay);
 	buf[0] = MCP2515_INSTRUCTION_READ;
 	buf[1] = CANINTF;
 	buf[2] = 0;	/* CANINTF */
@@ -1083,7 +1084,7 @@ static int mcp2515_probe(struct spi_device *spi)
 		goto out_clk;
 
 	priv->wq = alloc_workqueue("mcp2515_wq",
-		       WQ_FREEZABLE | WQ_MEM_RECLAIM | WQ_HIGHPRI, 0);
+		       WQ_FREEZABLE | WQ_MEM_RECLAIM, 0); // Had WQ_HIGHPRI
 	if (!priv->wq) {
 		err = -ENOMEM;
 		goto out_clk;
