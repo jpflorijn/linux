@@ -117,6 +117,9 @@ MODULE_LICENSE("GPL");
 
 #define MCP2515_DMA_SIZE		32
 #define MCP2515_IRQ_DELAY		(HZ / 5)
+#define MCP2515_TX_CNT 			3
+
+#define TX_MAP_BUSY	(1 << MCP2515_TX_CNT) - 1
 
 /* Network device private data */
 struct mcp2515_priv {
@@ -129,12 +132,15 @@ struct mcp2515_priv {
 	u8 canintf;		/* last read value of CANINTF register */
 	u8 eflg;		/* last read value of EFLG register */
 
-	struct sk_buff *skb;	/* skb to transmit or currently transmitting */
+	struct sk_buff *skb[MCP2515_TX_CNT];
 
 	spinlock_t lock;	/* Lock for the following flags: */
 	unsigned busy:1;	/* set when pending async spi transaction */
 	unsigned interrupt:1;	/* set when pending interrupt handling */
-	unsigned transmit:1;	/* set when pending transmission */
+	unsigned netif_queue_stopped:1;
+	u8 loaded_txb;		/* set to the currently loaded transmit buffer */
+	u8 tx_busy_map;		/* set for busy transmit buffer(s) */
+	u8 tx_pending_map; 	/* set for transmit buffer(s) pending a transmission */
 
 	unsigned extra:1;	/* set when the delay queue tried reading CANINTF */
 	unsigned skip;
@@ -175,8 +181,8 @@ static void mcp2515_read_rxb0_complete(void *context);
 static void mcp2515_read_rxb1_complete(void *context);
 static void mcp2515_clear_canintf_complete(void *context);
 static void mcp2515_clear_eflg_complete(void *context);
-static void mcp2515_load_txb0_complete(void *context);
-static void mcp2515_rts_txb0_complete(void *context);
+static void mcp2515_load_txb_complete(void *context);
+static void mcp2515_rts_txb_complete(void *context);
 
 /*
  * Write VALUE to register at address ADDR.
@@ -448,6 +454,7 @@ static void mcp2515_clear_canintf(struct net_device *dev)
 	struct mcp2515_priv *priv = netdev_priv(dev);
 	u8 *buf = (u8 *)priv->transfer.tx_buf;
 
+	/* RX1IF & RX0IF flag cleared automatically during read */
 	buf[0] = MCP2515_INSTRUCTION_BIT_MODIFY;
 	buf[1] = CANINTF;
 	buf[2] = priv->canintf & ~(CANINTF_RX0IF | CANINTF_RX1IF); /* mask */
@@ -507,35 +514,36 @@ static int mcp2515_set_txbuf(u8 *buf, const struct sk_buff *skb)
 }
 
 /*
- * Send the "load transmit buffer 0" SPI message.
+ * Send the "load transmit buffer" SPI message.
  * Asynchronous.
  */
-static void mcp2515_load_txb0(struct sk_buff *skb, struct net_device *dev)
+static void mcp2515_load_txb(struct sk_buff *skb, struct net_device *dev, u8 abc)
 {
 	struct mcp2515_priv *priv = netdev_priv(dev);
 	u8 *buf = (u8 *)priv->transfer.tx_buf;
 
-	buf[0] = MCP2515_INSTRUCTION_LOAD_TXB(0);
+	buf[0] = MCP2515_INSTRUCTION_LOAD_TXB(abc);
 	priv->transfer.len = mcp2515_set_txbuf(buf + 1, skb) + 1;
-	priv->message.complete = mcp2515_load_txb0_complete;
+	priv->message.complete = mcp2515_load_txb_complete;
+	priv->loaded_txb = abc;
 
-	can_put_echo_skb(skb, dev, 0);
+	can_put_echo_skb(skb, dev, abc);
 
 	mcp2515_spi_async(dev);
 }
 
 /*
- * Send the "request to send transmit buffer 0" SPI message.
+ * Send the "request to send transmit buffer" SPI message.
  * Asynchronous.
  */
-static void mcp2515_rts_txb0(struct net_device *dev)
+static void mcp2515_rts_txb(struct net_device *dev)
 {
 	struct mcp2515_priv *priv = netdev_priv(dev);
 	u8 *buf = (u8 *)priv->transfer.tx_buf;
 
-	buf[0] = MCP2515_INSTRUCTION_RTS(0);
+	buf[0] = MCP2515_INSTRUCTION_RTS(priv->loaded_txb);
 	priv->transfer.len = 1;
-	priv->message.complete = mcp2515_rts_txb0_complete;
+	priv->message.complete = mcp2515_rts_txb_complete;
 
 	mcp2515_spi_async(dev);
 }
@@ -570,10 +578,16 @@ static void mcp2515_read_flags_complete(void *context)
 		mcp2515_clear_canintf(dev);
 	else {
 		spin_lock(&priv->lock);
-		if (priv->transmit) {
-			priv->transmit = 0;
+		if (priv->tx_pending_map != 0) {
+			u8 pending_tx_id = 0;
+			for (; pending_tx_id < MCP2515_TX_CNT; pending_tx_id++) {
+				if ((BIT(pending_tx_id) & priv->tx_pending_map)) {
+					priv->tx_pending_map &= ~BIT(pending_tx_id);
+					break;
+				}
+			}
 			spin_unlock(&priv->lock);
-			mcp2515_load_txb0(priv->skb, dev);
+			mcp2515_load_txb(priv->skb[pending_tx_id], dev, pending_tx_id);
 		} else if (priv->interrupt) {
 			priv->interrupt = 0;
 			spin_unlock(&priv->lock);
@@ -636,10 +650,17 @@ static void mcp2515_transmit_or_read_flags(struct net_device *dev)
 	struct mcp2515_priv *priv = netdev_priv(dev);
 
 	spin_lock(&priv->lock);
-	if (priv->transmit) {
-		priv->transmit = 0;
+
+	if (priv->tx_pending_map != 0) {
+		u8 pending_tx_id = 0;
+		for (; pending_tx_id < MCP2515_TX_CNT; pending_tx_id++) {
+			if ((BIT(pending_tx_id) & priv->tx_pending_map)) {
+				priv->tx_pending_map &= ~BIT(pending_tx_id);
+				break;
+			}
+		}
 		spin_unlock(&priv->lock);
-		mcp2515_load_txb0(priv->skb, dev);
+		mcp2515_load_txb(priv->skb[pending_tx_id], dev, pending_tx_id);
 	} else {
 		spin_unlock(&priv->lock);
 		mcp2515_read_flags(dev);
@@ -674,6 +695,16 @@ static void mcp2515_read_rxb1_complete(void *context)
 	mcp2515_transmit_or_read_flags(dev);
 }
 
+static void mcp2515_update_device_stats(struct net_device *dev, struct sk_buff *skb, u8 idx)
+{
+	if (skb) {
+		struct can_frame *f = (struct can_frame *)skb->data;
+		dev->stats.tx_bytes += f->can_dlc;
+		dev->stats.tx_packets++;
+		can_get_echo_skb(dev, idx);
+	}
+}
+
 /*
  * Called when the "clear CANINTF bits" SPI message completes.
  */
@@ -683,14 +714,22 @@ static void mcp2515_clear_canintf_complete(void *context)
 	struct mcp2515_priv *priv = netdev_priv(dev);
 
 	if (priv->canintf & CANINTF_TX0IF) {
-		struct sk_buff *skb = priv->skb;
-		if (skb) {
-			struct can_frame *f = (struct can_frame *)skb->data;
-			dev->stats.tx_bytes += f->can_dlc;
-			dev->stats.tx_packets++;
-			can_get_echo_skb(dev, 0);
-		}
-		priv->skb = NULL;
+		mcp2515_update_device_stats(dev, priv->skb[0], 0);
+		priv->skb[0] = NULL;
+		priv->tx_busy_map &= ~BIT(0);
+	}
+	if (priv->canintf & CANINTF_TX1IF) {
+		mcp2515_update_device_stats(dev, priv->skb[1], 1);
+		priv->skb[1] = NULL;
+		priv->tx_busy_map &= ~BIT(1);
+	}
+	if (priv->canintf & CANINTF_TX2IF) {
+		mcp2515_update_device_stats(dev, priv->skb[2], 2);
+		priv->skb[2] = NULL;
+		priv->tx_busy_map &= ~BIT(2);
+	}
+	if (priv->netif_queue_stopped) {
+		priv->netif_queue_stopped = 0;
 		netif_wake_queue(dev);
 	}
 
@@ -721,19 +760,19 @@ static void mcp2515_clear_eflg_complete(void *context)
 }
 
 /*
- * Called when the "load transmit buffer 0" SPI message completes.
+ * Called when the "load transmit buffer" SPI message completes.
  */
-static void mcp2515_load_txb0_complete(void *context)
+static void mcp2515_load_txb_complete(void *context)
 {
 	struct net_device *dev = context;
 
-	mcp2515_rts_txb0(dev);
+	mcp2515_rts_txb(dev);
 }
 
 /*
- * Called when the "request to send transmit buffer 0" SPI message completes.
+ * Called when the "request to send transmit buffer" SPI message completes.
  */
-static void mcp2515_rts_txb0_complete(void *context)
+static void mcp2515_rts_txb_complete(void *context)
 {
 	struct net_device *dev = context;
 
@@ -804,23 +843,34 @@ static netdev_tx_t mcp2515_start_xmit(struct sk_buff *skb,
 				      struct net_device *dev)
 {
 	struct mcp2515_priv *priv = netdev_priv(dev);
+	u8 tx_idx = 0;
 
 	if (can_dropped_invalid_skb(dev, skb))
 		return NETDEV_TX_OK;
 
-	netif_stop_queue(dev);
-	priv->skb = skb;
-
 	spin_lock(&priv->lock);
+	/* find a free tx slot */
+	for (; tx_idx < MCP2515_TX_CNT; tx_idx++) {
+		if ((BIT(tx_idx) & priv->tx_busy_map) == 0) {
+			priv->tx_busy_map |= BIT(tx_idx);
+			break;
+		}
+	}
+	if (priv->tx_busy_map >= TX_MAP_BUSY) {
+		priv->netif_queue_stopped = 1;
+		netif_stop_queue(dev);
+	}
+
+	priv->skb[tx_idx] = skb;
 	if (priv->busy) {
-		priv->transmit = 1;
+		priv->tx_pending_map |= BIT(tx_idx);
 		spin_unlock(&priv->lock);
 		return NETDEV_TX_OK;
 	}
 	priv->busy = 1;
 	spin_unlock(&priv->lock);
 
-	mcp2515_load_txb0(skb, dev);
+	mcp2515_load_txb(skb, dev, tx_idx);
 
 	return NETDEV_TX_OK;
 }
@@ -1050,7 +1100,7 @@ static int mcp2515_probe(struct spi_device *spi)
 	if (freq < 1000000 || freq > 25000000)
 		return -ERANGE;
 
-	dev = alloc_candev(sizeof(struct mcp2515_priv), 1);
+	dev = alloc_candev(sizeof(struct mcp2515_priv), MCP2515_TX_CNT);
 	if (!dev)
 		return -ENOMEM;
 
