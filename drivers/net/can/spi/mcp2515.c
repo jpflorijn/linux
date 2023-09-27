@@ -728,7 +728,7 @@ static void mcp2515_clear_canintf_complete(void *context)
 		priv->skb[2] = NULL;
 		priv->tx_busy_map &= ~BIT(2);
 	}
-	if (priv->netif_queue_stopped) {
+	if (priv->netif_queue_stopped && priv->tx_busy_map < TX_MAP_BUSY) {
 		priv->netif_queue_stopped = 0;
 		netif_wake_queue(dev);
 	}
