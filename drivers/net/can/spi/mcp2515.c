@@ -22,19 +22,20 @@
  * References: Microchip MCP2515 data sheet, DS21801E, 2007.
  */
 
+#include <linux/can.h>
+#include <linux/can/dev.h>
+#include <linux/clk.h>
 #include <linux/dma-mapping.h>
 #include <linux/init.h>
 #include <linux/interrupt.h>
-#include <linux/clk.h>
 #include <linux/module.h>
 #include <linux/netdevice.h>
 #include <linux/property.h>
+#include <linux/regulator/consumer.h>
 #include <linux/skbuff.h>
 #include <linux/spi/spi.h>
 #include <linux/spinlock.h>
-#include <linux/can.h>
-#include <linux/can/dev.h>
-#include <linux/regulator/consumer.h>
+#include <linux/timer.h>
 
 MODULE_DESCRIPTION("Driver for Microchip MCP2515 SPI CAN controller");
 MODULE_AUTHOR("Andre B. Oliveira <anbadeol@gmail.com>, "
@@ -121,6 +122,8 @@ MODULE_LICENSE("GPL");
 
 #define TX_MAP_BUSY	(1 << MCP2515_TX_CNT) - 1
 
+#define READ_FLAGS_TIMER_VAL_MS (msecs_to_jiffies(200))
+
 /* Network device private data */
 struct mcp2515_priv {
 	struct can_priv can;		/* must be first for all CAN network devices */
@@ -151,8 +154,8 @@ struct mcp2515_priv {
 	u8 rx_buf[14] __attribute__((aligned(8)));
 	u8 tx_buf[14] __attribute__((aligned(8)));
 
-	struct workqueue_struct *wq;
-	struct work_struct irq_work;
+	struct tasklet_struct tasklet;
+	struct timer_list timer;
 	struct delayed_work delay;
 };
 
@@ -577,7 +580,7 @@ static void mcp2515_read_flags_complete(void *context)
 	else if (canintf)
 		mcp2515_clear_canintf(dev);
 	else {
-		spin_lock(&priv->lock);
+		spin_lock_bh(&priv->lock);
 		if (priv->tx_pending_map != 0) {
 			u8 pending_tx_id = 0;
 			for (; pending_tx_id < MCP2515_TX_CNT; pending_tx_id++) {
@@ -586,18 +589,17 @@ static void mcp2515_read_flags_complete(void *context)
 					break;
 				}
 			}
-			spin_unlock(&priv->lock);
+			spin_unlock_bh(&priv->lock);
 			mcp2515_load_txb(priv->skb[pending_tx_id], dev, pending_tx_id);
 		} else if (priv->interrupt) {
 			priv->interrupt = 0;
-			spin_unlock(&priv->lock);
+			spin_unlock_bh(&priv->lock);
 			mcp2515_read_flags(dev);
 		} else {
 			priv->busy = 0;
-			spin_unlock(&priv->lock);
-
-			/* Retry shortly. */
-			queue_delayed_work(priv->wq, &priv->delay, MCP2515_IRQ_DELAY);
+			spin_unlock_bh(&priv->lock);
+			/* Retry after READ_FLAGS_TIMER_VAL_MS. */
+			mod_timer(&priv->timer, jiffies + READ_FLAGS_TIMER_VAL_MS);
 		}
 	}
 }
@@ -649,7 +651,7 @@ static void mcp2515_transmit_or_read_flags(struct net_device *dev)
 {
 	struct mcp2515_priv *priv = netdev_priv(dev);
 
-	spin_lock(&priv->lock);
+	spin_lock_bh(&priv->lock);
 
 	if (priv->tx_pending_map != 0) {
 		u8 pending_tx_id = 0;
@@ -659,10 +661,10 @@ static void mcp2515_transmit_or_read_flags(struct net_device *dev)
 				break;
 			}
 		}
-		spin_unlock(&priv->lock);
+		spin_unlock_bh(&priv->lock);
 		mcp2515_load_txb(priv->skb[pending_tx_id], dev, pending_tx_id);
 	} else {
-		spin_unlock(&priv->lock);
+		spin_unlock_bh(&priv->lock);
 		mcp2515_read_flags(dev);
 	}
 }
@@ -787,48 +789,47 @@ static irqreturn_t mcp2515_interrupt(int irq, void *dev_id)
 	struct net_device *dev = dev_id;
 	struct mcp2515_priv *priv = netdev_priv(dev);
 
-	queue_work(priv->wq, &priv->irq_work);
+	tasklet_schedule(&priv->tasklet);
 
 	return IRQ_HANDLED;
 }
 
 /*
- * IRQ work handler, handles interrupts outside the interrupt context.
+ * IRQ handler, handles interrupts outside the hardware interrupt context.
  */
-static void mcp2515_irq_work_handler(struct work_struct *ws)
+static void mcp2515_softirq_handler(unsigned long priv_arg)
 {
-	struct mcp2515_priv *priv;
+	struct mcp2515_priv *priv = (struct mcp2515_priv *)priv_arg;
 
-	priv = container_of(ws, struct mcp2515_priv, irq_work);
-	spin_lock(&priv->lock);
+	spin_lock_bh(&priv->lock);
 	if (priv->busy) {
 		priv->interrupt = 1;
-		spin_unlock(&priv->lock);
+		spin_unlock_bh(&priv->lock);
 		return;
 	}
 	priv->busy = 1;
-	spin_unlock(&priv->lock);
+	spin_unlock_bh(&priv->lock);
 
 	mcp2515_read_flags(dev_get_drvdata(&priv->spi->dev));
 }
 
 /*
- * Delayed work handler, in effect polls the MCP2515's interrupts.
+ * Timer callback, polls the MCP2515's interrupts.
  */
-static void mcp2515_delay_handler(struct work_struct *ws)
+static void read_flags_timer_cb(struct timer_list *tmr)
 {
 	struct mcp2515_priv *priv;
-	priv = container_of(ws, struct mcp2515_priv, delay.work);
+	priv = container_of(tmr, struct mcp2515_priv, timer);
 
-	spin_lock(&priv->lock);
+	spin_lock_bh(&priv->lock);
 	if (priv->busy) {
-		spin_unlock(&priv->lock);
+		spin_unlock_bh(&priv->lock);
 		if (++priv->skip > 10)
 			netdev_dbg(dev_get_drvdata(&priv->spi->dev),
 				"continually busy (now %i times)\n", priv->skip);
 	} else {
 		priv->busy = 1;
-		spin_unlock(&priv->lock);
+		spin_unlock_bh(&priv->lock);
 		priv->skip = 0;
 		priv->extra = 1;
 
@@ -848,7 +849,7 @@ static netdev_tx_t mcp2515_start_xmit(struct sk_buff *skb,
 	if (can_dropped_invalid_skb(dev, skb))
 		return NETDEV_TX_OK;
 
-	spin_lock(&priv->lock);
+	spin_lock_bh(&priv->lock);
 	/* find a free tx slot */
 	for (; tx_idx < MCP2515_TX_CNT; tx_idx++) {
 		if ((BIT(tx_idx) & priv->tx_busy_map) == 0) {
@@ -864,11 +865,11 @@ static netdev_tx_t mcp2515_start_xmit(struct sk_buff *skb,
 	priv->skb[tx_idx] = skb;
 	if (priv->busy) {
 		priv->tx_pending_map |= BIT(tx_idx);
-		spin_unlock(&priv->lock);
+		spin_unlock_bh(&priv->lock);
 		return NETDEV_TX_OK;
 	}
 	priv->busy = 1;
-	spin_unlock(&priv->lock);
+	spin_unlock_bh(&priv->lock);
 
 	mcp2515_load_txb(skb, dev, tx_idx);
 
@@ -1133,21 +1134,16 @@ static int mcp2515_probe(struct spi_device *spi)
 	if (err)
 		goto out_clk;
 
-	priv->wq = alloc_workqueue("mcp2515_wq",
-		       WQ_FREEZABLE | WQ_MEM_RECLAIM, 0); // Had WQ_HIGHPRI
-	if (!priv->wq) {
-		err = -ENOMEM;
-		goto out_clk;
-	}
-	INIT_WORK(&priv->irq_work, mcp2515_irq_work_handler);
-	INIT_DELAYED_WORK(&priv->delay, mcp2515_delay_handler);
+	timer_setup(&priv->timer, read_flags_timer_cb, 0);
+
+	tasklet_init(&priv->tasklet, mcp2515_softirq_handler, (unsigned long)priv);
 
 	priv->power = devm_regulator_get_optional(&spi->dev, "vdd");
 	priv->transceiver = devm_regulator_get_optional(&spi->dev, "xceiver");
 	if ((PTR_ERR(priv->power) == -EPROBE_DEFER) ||
 		(PTR_ERR(priv->transceiver) == -EPROBE_DEFER)) {
 		err = -EPROBE_DEFER;
-		goto out_wq;
+		goto out_irqs;
 	}
 
 	mcp2515_setup_spi_messages(dev);
@@ -1167,9 +1163,9 @@ static int mcp2515_probe(struct spi_device *spi)
  out_spi:
 	mcp2515_cleanup_spi_messages(dev);
 	dev_set_drvdata(&spi->dev, NULL);
- out_wq:
-	destroy_workqueue(priv->wq);
-	priv->wq = NULL;
+ out_irqs:
+ 	del_timer(&priv->timer);
+	tasklet_kill(&priv->tasklet);
  out_clk:
 	clk_disable_unprepare(clk);
  out_free:
@@ -1191,10 +1187,8 @@ static int mcp2515_remove(struct spi_device *spi)
 	dev_set_drvdata(&spi->dev, NULL);
 	free_candev(dev);
 
-	cancel_delayed_work_sync(&priv->delay);
-	cancel_work_sync(&priv->irq_work);
-	destroy_workqueue(priv->wq);
-	priv->wq = NULL;
+	del_timer(&priv->timer);
+	tasklet_kill(&priv->tasklet);
 
 	return 0;
 }
